@@ -1,0 +1,204 @@
+<?php
+
+namespace ProcessWire;
+
+class MailQueue extends WireData implements Module, ConfigurableModule
+{
+
+    public function install()
+    {
+        $this->database->query("CREATE TABLE `mail_queue` (
+            `id` int(10) unsigned NOT NULL AUTO_INCREMENT COMMENT 'ID',
+            `added` timestamp NOT NULL COMMENT 'Date added',
+            `archived` int(1) NOT NULL DEFAULT '0' COMMENT 'Archived',
+            `maildata` text NOT NULL COMMENT 'Mail Data',
+            PRIMARY KEY (`id`)
+            ) ENGINE=MyISAM DEFAULT CHARSET=utf8 COMMENT='Mail Queue'");
+    }
+
+
+    public function uninstall()
+    {
+        // @todo: delete database if empty
+    }
+
+
+    public function init()
+    {
+        $this->addHookAfter("WireMailSmtp::send", $this, "catchMails");
+        $this->addHook("LazyCron::" . $this->queue_interval, $this, "consume");
+    }
+
+
+    public function catchMails(HookEvent $event)
+    {
+        if ($event->return > 0) return;
+
+        /** @var \WireMailSmtp $mail */
+        $mail = $event->object;
+
+        // Skip if mail is already in queue
+        if ($mail->get("in_queue")) return;
+
+        $result = $mail->getResult();
+        if (count($result["recipientsFailed"]) > 0) {
+            $this->addToQueue($mail);
+        }
+    }
+
+
+    public function addToQueue(\WireMailSmtp $mail): bool
+    {
+        $mailData = $mail->getResult();
+        $stmt = $this->database->prepare("INSERT INTO mail_queue (added, maildata) VALUES (:added, :maildata)");
+        return $stmt->execute(array(
+            ":added" => date("Y-m-d H:i:s"),
+            ":maildata" => serialize($mailData)
+        ));
+    }
+
+
+    private function getQueueItems(): array
+    {
+        $stmt = $this->database->prepare("SELECT * FROM mail_queue WHERE archived = 0 ORDER BY added");
+        $stmt->execute();
+        $entries = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        for ($i = 0; $i < count($entries); $i++) {
+            $entries[$i]["maildata"] = unserialize($entries[$i]["maildata"]);
+        }
+
+        return $entries;
+    }
+
+
+    public function consume() {
+        // Load queue items from database
+        $entries = $this->getQueueItems();
+
+        // Loop through items
+        $sent = 0;
+        $archived = 0;
+        $sentIds = [];
+        $archivedIds = [];
+        $now = time();
+        $threshold = 60 * 60 * 48;
+
+        foreach ($entries as $entry) {
+            // If e-mail is older than 48 hours: set archive flag and notify monitoring tool
+            if ($now - strtotime($entry["added"]) >= $threshold) {
+                $archivedIds[] = $entry["id"];
+                $archived++;
+
+                // @todo: send post request to monitoring tool
+            } else {
+                // If not: try to resend e-mail. If that works, delete corresponding queue entry
+                if ($this->resend($entry)) {
+                    $sentIds[] = $entry["id"];
+                    $sent++;
+                }
+            }
+        }
+
+        // Archive old items
+        if (count($archivedIds) > 0) {
+            $updateStmt = $this->database->prepare("UPDATE mail_queue SET archived = 1 WHERE id IN (:archivedIds)");
+            $updateStmt->execute([
+                ":archivedIds" => implode(",", $archivedIds)
+            ]);
+        }
+
+        // Delete sent items
+        if (count($sentIds) > 0) {
+            $deleteStmt = $this->database->prepare("DELETE FROM mail_queue WHERE id IN (:sentIds)");
+            $deleteStmt->execute([
+                ":sentIds" => implode(",", $sentIds)
+            ]);
+        }
+
+        if ($sent + $archived > 0) {
+            $this->log("Successfully consumed queued messages: $sent sent, $archived archived.");
+        }
+    }
+
+    private function resend($entry): bool
+    {
+        $mailData = $entry["maildata"];
+
+        // Resolve recipients
+        $to = [];
+        $cc = [];
+        $bcc = [];
+
+        foreach ($mailData["recipients"] as $recipient) {
+            if (!array_key_exists($recipient["emailaddress"], $mailData["recipientsFailed"])) continue;
+            switch ($recipient["type"]) {
+                case "cc":
+                    $cc[$recipient["emailaddress"]] = $recipient["name"] ?: $recipient["emailaddress"];
+                    break;
+                case "bcc":
+                    $bcc[$recipient["emailaddress"]] = $recipient["name"] ?: $recipient["emailaddress"];
+                    break;
+                case "to":
+                default:
+                    $to[$recipient["emailaddress"]] = $recipient["name"] ?: $recipient["emailaddress"];
+                    break;
+            }
+        }
+
+        if (count($to) == 0) {
+            $this->log("No valid recipients found for queue item ID " . $entry["id"]);
+            return false;
+        }
+
+        $mail = wireMail();
+        try {
+            $mail->to($to);
+        } catch (WireException $exception) {
+            $this->log("Error assigning recipients (to)");
+            $this->log($exception->getMessage());
+            return false;
+        }
+        if (count($cc) > 0) {
+            try {
+                $mail->cc($cc);
+            } catch (WireException $exception) {
+                $this->log("Error assigning recipients (cc)");
+                $this->log($exception->getMessage());
+                return false;
+            }
+        }
+        if (count($bcc) > 0) {
+            try {
+                $mail->bcc($bcc);
+            } catch (WireException $exception) {
+                $this->log("Error assigning recipients (bcc)");
+                $this->log($exception->getMessage());
+                return false;
+            }
+        }
+
+        try {
+            $mail->from($this->modules->getConfig("WireMailSmtp", "sender_email"));
+        } catch (WireException $exception) {
+            $this->log("Error assigning from email address");
+            $this->log($exception->getMessage());
+            return false;
+        }
+
+        $mail->fromName($this->modules->getConfig("WireMailSmtp", "sender_name"));
+        $mail->subject($mailData["subject"]);
+        $mail->body($mailData["textbody"]);
+        $mail->bodyHTML($mailData["htmlbody"]);
+        $mail->set("in_queue", true);
+
+        return ($mail->send() > 0);
+    }
+
+    public static function getModuleConfigInputfields(array $data): InputfieldWrapper
+    {
+        require_once(__DIR__ . "/MailQueueConfig.php");
+        $c = new MailQueueConfig($data);
+        return $c->getConfig();
+    }
+}
